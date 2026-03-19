@@ -20,7 +20,7 @@ class LinkedInSetting extends Model
         static::updateOrCreate(['key' => $key], ['value' => $value]);
     }
 
-    public static function increement(string $key): int
+    public static function incrementSetting(string $key): int
     {
         $current = (int) static::get($key, 0);
         $next    = $current + 1;

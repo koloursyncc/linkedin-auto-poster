@@ -41,9 +41,9 @@ class LinkedInCommentLead extends Model
     public function scopePendingFollowUp($query)
     {
         return $query->where('dm_status', 'sent')
-            ->where('followup_status', 'pending')
-            ->where('dm_sent_at', '<=', now()->subHours(
-                config('linkedin.followup_delay_hours', 24)
-            ));
+                     ->where('followup_status', 'pending')
+                     ->where('dm_sent_at', '<=', now()->subHours(
+                         config('linkedin.followup_delay_hours', 24)
+                     ));
     }
 }

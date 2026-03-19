@@ -5,37 +5,29 @@ namespace App\Http\Controllers;
 use App\Models\LinkedInCommentLead;
 use App\Models\LinkedInPost;
 use App\Models\LinkedInSetting;
-use App\Services\LinkedIn\LinkedInService;
+use App\Services\LinkedIn\PostAnglesLibrary;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Artisan;
 
-
-// ============================================================
-// Admin Dashboard Controller
-// ============================================================
 class LinkedInDashboardController extends Controller
 {
     public function index()
     {
-        $token      = LinkedInSetting::get('linkedin_token');
-        $expiresAt  = LinkedInSetting::get('token_expires_at');
-        $isActive   = LinkedInSetting::get('automation_active', '1') === '1';
-        $rotIndex   = (int) LinkedInSetting::get('rotation_index', 0);
+        $token            = LinkedInSetting::get('linkedin_token');
+        $expiresAt        = LinkedInSetting::get('token_expires_at');
+        $isActive         = LinkedInSetting::get('automation_active', '1') === '1';
+        $leadMagnetsOn    = LinkedInSetting::get('lead_magnets_active', '0') === '1';
+        $rotIndex         = (int) LinkedInSetting::get('rotation_index', 0);
 
-        $recentPosts = LinkedInPost::latest()
-            ->take(20)
-            ->get();
+        $recentPosts = LinkedInPost::latest()->take(20)->get();
 
-        $totalLeads     = LinkedInCommentLead::count();
-        $pendingDMs     = LinkedInCommentLead::where('dm_status', 'pending')->count();
-        $sentDMs        = LinkedInCommentLead::where('dm_status', 'sent')->count();
+        $totalLeads       = LinkedInCommentLead::count();
+        $pendingDMs       = LinkedInCommentLead::where('dm_status', 'pending')->count();
+        $sentDMs          = LinkedInCommentLead::where('dm_status', 'sent')->count();
         $pendingFollowUps = LinkedInCommentLead::where('followup_status', 'pending')
-            ->where('dm_status', 'sent')
-            ->count();
+            ->where('dm_status', 'sent')->count();
 
-        $leads = LinkedInCommentLead::with('post')
-            ->latest()
-            ->take(30)
-            ->get();
+        $leads = LinkedInCommentLead::with('post')->latest()->take(30)->get();
 
         $tokenExpiringSoon = $expiresAt && now()->diffInDays($expiresAt) <= 7;
 
@@ -43,6 +35,7 @@ class LinkedInDashboardController extends Controller
             'token',
             'expiresAt',
             'isActive',
+            'leadMagnetsOn',
             'rotIndex',
             'recentPosts',
             'totalLeads',
@@ -54,7 +47,7 @@ class LinkedInDashboardController extends Controller
         ));
     }
 
-    public function toggleAutomation(Request $request)
+    public function toggleAutomation()
     {
         $current = LinkedInSetting::get('automation_active', '1');
         LinkedInSetting::set('automation_active', $current === '1' ? '0' : '1');
@@ -62,18 +55,27 @@ class LinkedInDashboardController extends Controller
         return back()->with('success', 'Automation ' . ($current === '1' ? 'paused' : 'resumed') . '.');
     }
 
+    public function toggleLeadMagnets()
+    {
+        $current = LinkedInSetting::get('lead_magnets_active', '0');
+        $next    = $current === '1' ? '0' : '1';
+        LinkedInSetting::set('lead_magnets_active', $next);
+
+        return back()->with('success', 'Lead magnet posts ' . ($next === '1' ? 'enabled' : 'disabled') . '.');
+    }
+
     public function resetIndex(Request $request)
     {
         $request->validate(['index' => 'required|integer|min:0']);
         LinkedInSetting::set('rotation_index', $request->index);
 
-        return back()->with('success', "Rotation index reset to {$request->index}.");
+        return back()->with('success', "Rotation index set to {$request->index}.");
     }
 
-    public function previewPost(Request $request)
+    public function previewPost()
     {
         $index     = (int) LinkedInSetting::get('rotation_index', 0);
-        $angleData = \App\Services\LinkedIn\PostAnglesLibrary::getAngleForIndex($index);
+        $angleData = PostAnglesLibrary::getAngleForIndex($index);
 
         return response()->json([
             'index'    => $index,
@@ -84,18 +86,18 @@ class LinkedInDashboardController extends Controller
         ]);
     }
 
-    public function publishNow(Request $request)
+    public function publishNow()
     {
-        // Trigger the artisan command manually
-        \Artisan::call('linkedin:post');
-        $output = \Artisan::output();
+        Artisan::call('linkedin:post');
+        $output = trim(Artisan::output());
 
-        return back()->with('success', 'Post triggered: ' . $output);
+        return back()->with('success', 'Post triggered. ' . $output);
     }
 
     public function retryDM(LinkedInCommentLead $lead)
     {
-        $lead->update(['dm_status' => 'pending']);
+        $lead->update(['dm_status' => 'pending', 'error_message' => null]);
+
         return back()->with('success', 'DM queued for retry.');
     }
 }

@@ -16,9 +16,6 @@ class ClaudeService
         $this->model  = config('linkedin.anthropic_model', 'claude-sonnet-4-20250514');
     }
 
-    /**
-     * Generate a swipe-style LinkedIn post from an angle.
-     */
     public function generateSwipePost(string $angle): ?string
     {
         $system = <<<SYSTEM
@@ -33,7 +30,7 @@ WRITING RULES:
 - Max 2 emojis per post
 - Never use "partnership", "synergy", "delve", or "leverage"
 - Statements as facts, not hedged opinions
-- Indian market context throughout (rupees, kirana stores, India brands)
+- Indian market context throughout (rupees, kirana stores, Indian brands)
 - Never name specific Koloursyncc clients
 
 Choose the best format for the angle:
@@ -46,12 +43,9 @@ Choose the best format for the angle:
 Output ONLY the post text. No preamble, no labels, no explanation.
 SYSTEM;
 
-        return $this->callClaude($system, "Write a LinkedIn post about this angle: {$angle}");
+        return $this->call($system, "Write a LinkedIn post about this angle: {$angle}");
     }
 
-    /**
-     * Generate a lead magnet LinkedIn post.
-     */
     public function generateLeadMagnetPost(string $angle, string $keyword, string $resourceName): ?string
     {
         $system = <<<SYSTEM
@@ -77,13 +71,10 @@ SYSTEM;
 
         $prompt = "Write a lead magnet LinkedIn post.\nAngle: {$angle}\nKeyword: {$keyword}\nResource name: {$resourceName}";
 
-        return $this->callClaude($system, $prompt);
+        return $this->call($system, $prompt);
     }
 
-    /**
-     * Core API call to Claude.
-     */
-    private function callClaude(string $system, string $userMessage): ?string
+    private function call(string $system, string $userMessage): ?string
     {
         try {
             $response = Http::withHeaders([
@@ -100,18 +91,17 @@ SYSTEM;
             ]);
 
             if ($response->failed()) {
-                Log::error('Claude API error', [
+                Log::error('ClaudeService: API error', [
                     'status' => $response->status(),
                     'body'   => $response->body(),
                 ]);
                 return null;
             }
 
-            $data = $response->json();
-            return $data['content'][0]['text'] ?? null;
+            return $response->json()['content'][0]['text'] ?? null;
 
         } catch (\Exception $e) {
-            Log::error('Claude API exception', ['message' => $e->getMessage()]);
+            Log::error('ClaudeService: exception', ['message' => $e->getMessage()]);
             return null;
         }
     }

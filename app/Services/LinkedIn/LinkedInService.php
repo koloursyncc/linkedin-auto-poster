@@ -2,6 +2,7 @@
 
 namespace App\Services\LinkedIn;
 
+use App\Models\LinkedInSetting;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 
@@ -11,12 +12,13 @@ class LinkedInService
 
     public function __construct()
     {
-        $this->personUrn = config('linkedin.person_urn') || null;
+        // DB setting takes priority — written on first OAuth connect.
+        // Falls back to .env if someone set it manually.
+        $this->personUrn = LinkedInSetting::get('linkedin_person_urn')
+            ?? config('linkedin.person_urn', '');
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // OAUTH
-    // ──────────────────────────────────────────────────────────────────────────
+    // ── OAUTH ─────────────────────────────────────────────────────────────────
 
     public function getAuthUrl(): string
     {
@@ -42,7 +44,7 @@ class LinkedInService
         ]);
 
         if ($response->failed()) {
-            Log::error('LinkedIn token exchange failed', ['body' => $response->body()]);
+            Log::error('LinkedInService: token exchange failed', ['body' => $response->body()]);
             return null;
         }
 
@@ -51,19 +53,24 @@ class LinkedInService
 
     public function getPersonUrn(string $token): ?string
     {
-        $response = $this->apiGet('https://api.linkedin.com/v2/me', $token);
-        return $response ? 'urn:li:person:' . $response['id'] : null;
+        // /v2/me requires special Marketing API access.
+        // /v2/userinfo works with standard openid + profile scope.
+        // Returns 'sub' which is the person ID.
+        $response = $this->apiGet('https://api.linkedin.com/v2/userinfo', $token);
+        $sub      = $response['sub'] ?? null;
+
+        return $sub ? 'urn:li:person:' . $sub : null;
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // POSTING
-    // ──────────────────────────────────────────────────────────────────────────
+    // ── POSTING ───────────────────────────────────────────────────────────────
 
-    /**
-     * Publish a text post to LinkedIn. Returns the LinkedIn post ID or null.
-     */
     public function publishPost(string $text, string $token): ?string
     {
+        if (empty($this->personUrn)) {
+            Log::error('LinkedInService: personUrn is empty — re-connect LinkedIn at /linkedin/dashboard');
+            return null;
+        }
+
         $payload = [
             'author'          => $this->personUrn,
             'lifecycleState'  => 'PUBLISHED',
@@ -80,71 +87,54 @@ class LinkedInService
 
         try {
             $response = Http::withHeaders([
-                'Authorization'              => "Bearer {$token}",
-                'Content-Type'               => 'application/json',
-                'X-Restli-Protocol-Version'  => '2.0.0',
+                'Authorization'             => "Bearer {$token}",
+                'Content-Type'              => 'application/json',
+                'X-Restli-Protocol-Version' => '2.0.0',
             ])->post('https://api.linkedin.com/v2/ugcPosts', $payload);
 
             if ($response->failed()) {
-                Log::error('LinkedIn post failed', [
+                Log::error('LinkedInService: publishPost failed', [
                     'status' => $response->status(),
                     'body'   => $response->body(),
                 ]);
                 return null;
             }
 
-            // LinkedIn returns the post ID in the X-RestLi-Id header
-            $postId = $response->header('X-RestLi-Id')
+            return $response->header('X-RestLi-Id')
                 ?? ($response->json()['id'] ?? null);
 
-            return $postId;
         } catch (\Exception $e) {
-            Log::error('LinkedIn publishPost exception', ['message' => $e->getMessage()]);
+            Log::error('LinkedInService: publishPost exception', ['message' => $e->getMessage()]);
             return null;
         }
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // COMMENT POLLING
-    // ──────────────────────────────────────────────────────────────────────────
+    // ── COMMENT POLLING ───────────────────────────────────────────────────────
 
-    /**
-     * Fetch comments on a specific LinkedIn UGC post.
-     * Returns array of comment objects or empty array.
-     */
     public function getPostComments(string $linkedinPostId, string $token): array
     {
-        // URL-encode the post ID for use as a query param
-        $encoded = urlencode($linkedinPostId);
-        $url = "https://api.linkedin.com/v2/socialActions/{$encoded}/comments";
-
+        $encoded  = urlencode($linkedinPostId);
+        $url      = "https://api.linkedin.com/v2/socialActions/{$encoded}/comments";
         $response = $this->apiGet($url, $token, ['count' => 50, 'start' => 0]);
 
-        if (!$response || !isset($response['elements'])) {
-            return [];
-        }
-
-        return $response['elements'];
+        return $response['elements'] ?? [];
     }
 
-    /**
-     * Parse comments and check if any contain a lead magnet keyword.
-     * Returns array of matched leads: [commenter_urn, comment_id, comment_text, keyword]
-     */
     public function extractKeywordComments(array $comments): array
     {
         $keywords = array_keys(config('linkedin.resources', []));
         $leads    = [];
 
         foreach ($comments as $comment) {
-            $text       = $comment['message']['text'] ?? '';
-            $commentId  = $comment['id'] ?? null;
-            $actorUrn   = $comment['actor'] ?? null;
+            $text      = $comment['message']['text'] ?? '';
+            $commentId = $comment['id'] ?? null;
+            $actorUrn  = $comment['actor'] ?? null;
 
-            if (!$commentId || !$actorUrn) continue;
+            if (!$commentId || !$actorUrn) {
+                continue;
+            }
 
             foreach ($keywords as $keyword) {
-                // Case-insensitive exact word match
                 if (stripos($text, $keyword) !== false) {
                     $leads[] = [
                         'commenter_urn' => $actorUrn,
@@ -152,7 +142,7 @@ class LinkedInService
                         'comment_text'  => $text,
                         'keyword'       => strtoupper($keyword),
                     ];
-                    break; // only match first keyword per comment
+                    break;
                 }
             }
         }
@@ -160,14 +150,8 @@ class LinkedInService
         return $leads;
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // DIRECT MESSAGES
-    // ──────────────────────────────────────────────────────────────────────────
+    // ── DIRECT MESSAGES ───────────────────────────────────────────────────────
 
-    /**
-     * Send a LinkedIn DM to a person URN.
-     * Uses the Messages API (requires w_member_social scope).
-     */
     public function sendDM(string $recipientUrn, string $message, string $token): bool
     {
         $payload = [
@@ -186,7 +170,7 @@ class LinkedInService
             ])->post('https://api.linkedin.com/v2/messages', $payload);
 
             if ($response->failed()) {
-                Log::error('LinkedIn DM failed', [
+                Log::error('LinkedInService: sendDM failed', [
                     'recipient' => $recipientUrn,
                     'status'    => $response->status(),
                     'body'      => $response->body(),
@@ -195,21 +179,18 @@ class LinkedInService
             }
 
             return true;
+
         } catch (\Exception $e) {
-            Log::error('LinkedIn sendDM exception', ['message' => $e->getMessage()]);
+            Log::error('LinkedInService: sendDM exception', ['message' => $e->getMessage()]);
             return false;
         }
     }
 
-    /**
-     * Build the initial DM message for a lead magnet keyword.
-     */
     public function buildLeadMagnetDM(string $keyword, string $commenterName = ''): string
     {
         $resources = config('linkedin.resources', []);
         $link      = $resources[$keyword] ?? null;
-
-        $greeting = $commenterName ? "Hey {$commenterName}!" : 'Hey!';
+        $greeting  = $commenterName ? "Hey {$commenterName}!" : 'Hey!';
 
         $resourceNames = [
             'AUDIT'    => 'FMCG Packaging Audit Checklist',
@@ -243,33 +224,30 @@ class LinkedInService
         return "{$greeting} Here's your {$name} 👇\n\n{$link}\n\nDM me if you have any questions — happy to give you a quick take on your specific situation.";
     }
 
-    /**
-     * Build the 24-hour follow-up DM.
-     */
     public function buildFollowUpDM(string $keyword, string $commenterName = ''): string
     {
-        $greeting = $commenterName ? "Hey {$commenterName}," : 'Hey,';
+        $greeting  = $commenterName ? "Hey {$commenterName}," : 'Hey,';
 
         $followUps = [
-            'AUDIT'    => "Did you get a chance to run through the packaging audit checklist? Curious what your pack scored — DM me if anything flagged.",
-            'KIRANA'   => "Did the kirana shelf guide help? If you're working on packaging for general trade, happy to share some specific pointers.",
-            'STORY'    => "Did you get a chance to fill in the brand story template? Most founders are surprised by how much the 'villain' question clarifies their positioning.",
-            'SCORE'    => "Did you run the brand consistency scorecard? Most brands score 6-8 on their first attempt — usually more inconsistency than expected.",
-            'HOMEPAGE' => "Did you audit your homepage? The social-proof-above-the-fold point is the one most brands miss — let me know how it went.",
+            'AUDIT'    => "Did you get a chance to run through the packaging audit checklist? Curious what your pack scored.",
+            'KIRANA'   => "Did the kirana shelf guide help? Happy to share some specific pointers if you're working on general trade packaging.",
+            'STORY'    => "Did you get a chance to fill in the brand story template? The 'villain' question is usually the most clarifying one.",
+            'SCORE'    => "Did you run the brand consistency scorecard? Most brands score 6–8 on the first attempt.",
+            'HOMEPAGE' => "Did you audit your homepage? The social-proof-above-the-fold point is the one most brands miss.",
             'CONVERT'  => "Did the product page template help? The trust signal placement section tends to have the biggest immediate impact.",
             'CALENDAR' => "Did the content calendar work for your brand? Happy to tweak the topics for your specific product category.",
             'GRID'     => "Did you run the Instagram grid audit? The product-to-lifestyle image ratio is usually the quickest win.",
-            'IDENTITY' => "Did the brand identity starter kit help clarify what you actually need vs what you thought you needed?",
+            'IDENTITY' => "Did the brand identity starter kit help clarify what you actually need?",
             'BRIEF'    => "Did the logo brief template help? A good brief usually cuts revision rounds by half.",
-            'PITCH'    => "Did you get a chance to look at the pitch deck template? Slide 4 (sell-out proof) is the one most founders build last but distributors look at first.",
-            'INVEST'   => "Did the investor pitch guide help? The 'story not timeline' section tends to be the biggest mindset shift for founders.",
+            'PITCH'    => "Did you get a chance to look at the pitch deck template? Slide 4 (sell-out proof) is the one distributors look at first.",
+            'INVEST'   => "Did the investor pitch guide help? The 'story not timeline' section tends to be the biggest mindset shift.",
             'COPY'     => "Did the packaging copy formulas work for your product? The front-panel formula tends to have the biggest shelf impact.",
-            'VOICE'    => "Did you fill in the brand voice guide? The '3 words we never say' section usually surprises founders most.",
-            'ROI'      => "Did you run the ROI calculator? The numbers usually surprise founders — packaging ROI compounds in ways ad spend doesn't.",
+            'VOICE'    => "Did you fill in the brand voice guide? The 'words we never say' section usually surprises founders most.",
+            'ROI'      => "Did you run the ROI calculator? Packaging ROI compounds in ways ad spend doesn't.",
             'COMPETE'  => "Did the competitor audit reveal any white space for your brand?",
-            'LAUNCH'   => "Did the pre-launch checklist catch anything? The mobile checkout flow and WhatsApp contact points are the most commonly missed.",
-            'LI'       => "Did the LinkedIn calendar help? Happy to customise the week-2 themes for your specific niche.",
-            'NAME'     => "Did the naming framework help narrow things down? The trademark search step is the one most founders skip — and regret.",
+            'LAUNCH'   => "Did the pre-launch checklist catch anything? The WhatsApp contact point is the most commonly missed.",
+            'LI'       => "Did the LinkedIn calendar help? Happy to customise the themes for your specific niche.",
+            'NAME'     => "Did the naming framework help narrow things down? The trademark search step is the one most founders skip.",
             'SWIPE'    => "Did the copy swipe file help? The 'why us' section examples tend to be the most useful starting point.",
         ];
 
@@ -278,9 +256,7 @@ class LinkedInService
         return "{$greeting}\n\n{$followUp}";
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // HELPERS
-    // ──────────────────────────────────────────────────────────────────────────
+    // ── PRIVATE HELPERS ───────────────────────────────────────────────────────
 
     private function apiGet(string $url, string $token, array $params = []): ?array
     {
@@ -290,16 +266,18 @@ class LinkedInService
             ])->get($url, $params);
 
             if ($response->failed()) {
-                Log::error('LinkedIn API GET failed', [
+                Log::error('LinkedInService: GET failed', [
                     'url'    => $url,
                     'status' => $response->status(),
+                    'body'   => $response->body(),
                 ]);
                 return null;
             }
 
             return $response->json();
+
         } catch (\Exception $e) {
-            Log::error('LinkedIn apiGet exception', ['message' => $e->getMessage()]);
+            Log::error('LinkedInService: apiGet exception', ['message' => $e->getMessage()]);
             return null;
         }
     }
